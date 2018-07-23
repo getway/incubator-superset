@@ -41,7 +41,7 @@ import sqlparse
 from tableschema import Table
 from werkzeug.utils import secure_filename
 
-from superset import app, cache_util, conf, db, utils
+from superset import app, cache_util, conf, db, sql_parse, utils
 from superset.exceptions import SupersetTemplateException
 from superset.utils import QueryStatus
 
@@ -65,7 +65,6 @@ class BaseEngineSpec(object):
     """Abstract class for database engine specific configurations"""
 
     engine = 'base'  # str as defined in sqlalchemy.engine.engine
-    cursor_execute_kwargs = {}
     time_grains = tuple()
     time_groupby_inline = False
     limit_method = LimitMethod.FORCE_LIMIT
@@ -110,32 +109,19 @@ class BaseEngineSpec(object):
             )
             return database.compile_sqla_query(qry)
         elif LimitMethod.FORCE_LIMIT:
-            sql_without_limit = cls.get_query_without_limit(sql)
-            return '{sql_without_limit} LIMIT {limit}'.format(**locals())
+            parsed_query = sql_parse.SupersetQuery(sql)
+            sql = parsed_query.get_query_with_new_limit(limit)
         return sql
 
     @classmethod
     def get_limit_from_sql(cls, sql):
-        limit_pattern = re.compile(r"""
-                (?ix)          # case insensitive, verbose
-                \s+            # whitespace
-                LIMIT\s+(\d+)  # LIMIT $ROWS
-                ;?             # optional semi-colon
-                (\s|;)*$       # remove trailing spaces tabs or semicolons
-                """)
-        matches = limit_pattern.findall(sql)
-        if matches:
-            return int(matches[0][0])
+        parsed_query = sql_parse.SupersetQuery(sql)
+        return parsed_query.limit
 
     @classmethod
-    def get_query_without_limit(cls, sql):
-        return re.sub(r"""
-                (?ix)        # case insensitive, verbose
-                \s+          # whitespace
-                LIMIT\s+\d+  # LIMIT $ROWS
-                ;?           # optional semi-colon
-                (\s|;)*$     # remove trailing spaces tabs or semicolons
-                """, '', sql)
+    def get_query_with_new_limit(cls, sql, limit):
+        parsed_query = sql_parse.SupersetQuery(sql)
+        return parsed_query.get_query_with_new_limit(limit)
 
     @staticmethod
     def csv_to_df(**kwargs):
@@ -343,6 +329,10 @@ class BaseEngineSpec(object):
     @staticmethod
     def normalize_column_name(column_name):
         return column_name
+
+    @staticmethod
+    def execute(cursor, query, async=False):
+        cursor.execute(query)
 
 
 class PostgresBaseEngineSpec(BaseEngineSpec):
@@ -571,7 +561,6 @@ class SqliteEngineSpec(BaseEngineSpec):
 
 class MySQLEngineSpec(BaseEngineSpec):
     engine = 'mysql'
-    cursor_execute_kwargs = {'args': {}}
     time_grains = (
         Grain('Time Column', _('Time Column'), '{col}', None),
         Grain('second', _('second'), 'DATE_ADD(DATE({col}), '
@@ -652,7 +641,6 @@ class MySQLEngineSpec(BaseEngineSpec):
 
 class PrestoEngineSpec(BaseEngineSpec):
     engine = 'presto'
-    cursor_execute_kwargs = {'parameters': None}
 
     time_grains = (
         Grain('Time Column', _('Time Column'), '{col}', None),
@@ -951,7 +939,6 @@ class HiveEngineSpec(PrestoEngineSpec):
     """Reuses PrestoEngineSpec functionality."""
 
     engine = 'hive'
-    cursor_execute_kwargs = {'async': True}
 
     # Scoping regex at class level to avoid recompiling
     # 17/02/07 19:36:38 INFO ql.Driver: Total jobs = 5
@@ -1050,7 +1037,8 @@ class HiveEngineSpec(PrestoEngineSpec):
         for column_info in hive_table_schema['fields']:
             column_name_and_type.append(
                 '{} {}'.format(
-                    column_info['name'], convert_to_hive_type(column_info['type'])))
+                    "'" + column_info['name'] + "'",
+                    convert_to_hive_type(column_info['type'])))
         schema_definition = ', '.join(column_name_and_type)
 
         s3 = boto3.client('s3')
@@ -1242,6 +1230,10 @@ class HiveEngineSpec(PrestoEngineSpec):
             configuration['hive.server2.proxy.user'] = username
         return configuration
 
+    @staticmethod
+    def execute(cursor, query, async=False):
+        cursor.execute(query, async=async)
+
 
 class MssqlEngineSpec(BaseEngineSpec):
     engine = 'mssql'
@@ -1362,6 +1354,9 @@ class ClickHouseEngineSpec(BaseEngineSpec):
         Grain('day', _('day'),
               'toStartOfDay(toDateTime({col}))',
               'P1D'),
+        Grain('week', _('week'),
+              'toMonday(toDateTime({col}))',
+              'P1W'),
         Grain('month', _('month'),
               'toStartOfMonth(toDateTime({col}))',
               'P1M'),
